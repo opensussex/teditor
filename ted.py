@@ -49,6 +49,9 @@ class SimpleEditor:
         # Loop timeout (ms) - used so autosave checks can run; set by main()
         self.loop_timeout = 200
 
+        # Help overlay flag
+        self.show_help = False
+
         # If a filename provided on startup, open/create it
         if filename:
             self.open_file(filename)
@@ -279,7 +282,7 @@ class SimpleEditor:
                 # ignore if writing to bottom-right corner triggers an exception
                 pass
 
-        # Status line (bottom) — include leader hints and selection mode indicator; show filename and status_message
+        # Status line (bottom) — compact by default; extended help can be toggled
         sel_mode_text = " [SELECT]" if self.sel_mode else ""
         file_text = f" file: {self.filename}" if self.filename else " file: (unnamed)"
         status_core = "Ln {}/{} Col {}/{}  --".format(
@@ -288,9 +291,18 @@ class SimpleEditor:
             self.cx + 1,
             max(1, len(self.lines[self.cy]) if self.lines else 1),
         )
-        status = "{} Ctrl-W e:Command | Ctrl-W c:Copy Ctrl-W x:Cut Ctrl-W v:Paste Ctrl-W s:Save | F2:Select Mode | Shift+Arrows:Select{}{} ".format(
-            status_core, sel_mode_text, file_text
-        )
+
+        # When help is shown we keep the status compact; the help overlay displays the full hints.
+        if self.show_help:
+            status = "{} Ctrl-W h:Hide Help{}{}".format(
+                status_core, sel_mode_text, file_text
+            )
+        else:
+            # compact hints (minimal)
+            status = "{} Ctrl-W h:Help{}{}".format(
+                status_core, sel_mode_text, file_text
+            )
+
         # If we have a status message (like saved), append it
         if self.status_message:
             status += " -- " + self.status_message
@@ -306,6 +318,31 @@ class SimpleEditor:
                 )
         except curses.error:
             pass
+
+        # If help overlay is enabled, draw it above the status line
+        if self.show_help:
+            help_lines = [
+                "Help: Leader key is Ctrl-W then a letter. Available leader sequences:",
+                "  e: Command palette (type 'exit' to quit)    s: Save    c: Copy    x: Cut    v: Paste    h: Toggle help",
+                "Selection: F2 toggles selection mode (use arrows to extend). Shift+Arrows may also work.",
+                "Other: Ctrl-X: cut   Ctrl-V: paste   Enter: newline   Backspace: delete",
+            ]
+            # Determine start row for help to avoid overlapping content; place immediately above status
+            help_count = len(help_lines)
+            start_row = max(0, self.max_y - 1 - help_count)
+            row = start_row
+            for hl in help_lines:
+                display = hl[: self.max_x - 1]
+                try:
+                    self.stdscr.addstr(row, 0, display)
+                    # Clear remainder of the line
+                    if len(display) < self.max_x:
+                        self.stdscr.addstr(
+                            row, len(display), " " * (self.max_x - len(display) - 1)
+                        )
+                except curses.error:
+                    pass
+                row += 1
 
         # Move actual terminal cursor to visible position (unless selection active and cursor is on status)
         vis_y = self.cy - self.scroll_y
@@ -475,6 +512,7 @@ class SimpleEditor:
         x -> cut selection
         v -> paste clipboard
         s -> save (open save prompt)
+        h -> toggle help overlay
         """
         # Temporarily block for the next key so leader feels natural.
         # Restore the loop timeout afterwards.
@@ -510,6 +548,13 @@ class SimpleEditor:
         elif ch_char == "s":
             # Open save prompt, prefill with current filename if present
             self.save_prompt(prefill=self.filename)
+        elif ch_char == "h":
+            # Toggle help overlay
+            self.show_help = not self.show_help
+            if self.show_help:
+                self._set_status("Help shown (Ctrl-W h to hide)")
+            else:
+                self._set_status("Help hidden")
         else:
             # Unrecognized leader sequence: ignore
             pass
