@@ -2,6 +2,8 @@
 import curses
 import os
 import sys
+import tempfile
+import time
 
 CTRL_W = 23  # Ctrl-W ASCII code
 CTRL_X = 24  # Ctrl-X cut (direct)
@@ -35,6 +37,17 @@ class SimpleEditor:
         # Filename and status
         self.filename = None
         self.status_message = ""
+        self._status_time = None
+        self._status_duration = 3  # seconds for transient status messages
+
+        # Autosave state
+        self.autosave_interval = 5.0  # seconds
+        self._last_autosave = time.time()
+        self._autosave_path = None
+        self.dirty = False  # true when buffer changed since last save/autosave
+
+        # Loop timeout (ms) - used so autosave checks can run; set by main()
+        self.loop_timeout = 200
 
         # If a filename provided on startup, open/create it
         if filename:
@@ -65,6 +78,66 @@ class SimpleEditor:
         elif self.cx >= self.scroll_x + self.view_width:
             self.scroll_x = self.cx - self.view_width + 1
 
+    def _set_status(self, text):
+        self.status_message = text
+        self._status_time = time.time()
+
+    def _clear_expired_status(self):
+        if self._status_time is None:
+            return
+        if time.time() - self._status_time >= self._status_duration:
+            self.status_message = ""
+            self._status_time = None
+
+    def _determine_autosave_path(self):
+        # If filename exists, use .<basename>.autosave in same directory
+        if self.filename:
+            base = os.path.basename(self.filename)
+            dirpath = os.path.dirname(self.filename) or "."
+            autosave_name = "." + base + ".autosave"
+            return os.path.join(dirpath, autosave_name)
+        else:
+            # Use a default autosave in CWD
+            return os.path.join(os.getcwd(), ".ted_autosave")
+
+    def autosave(self):
+        # Only autosave if buffer is dirty
+        if not self.dirty:
+            return
+        path = self._determine_autosave_path()
+        try:
+            # Ensure directory exists
+            dirpath = os.path.dirname(path)
+            if dirpath and not os.path.exists(dirpath):
+                os.makedirs(dirpath, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(self.lines))
+            self._last_autosave = time.time()
+            self._autosave_path = path
+            # mark as not dirty until next user change
+            self.dirty = False
+            self._set_status(f"Autosaved to {path}")
+        except Exception as e:
+            self._set_status(f"Autosave error: {e}")
+
+    def cleanup_autosave(self):
+        """
+        Remove any autosave file associated with the current buffer.
+        Called on exit to avoid leaving stray autosave files behind.
+        """
+        try:
+            path = self._determine_autosave_path()
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    # Best-effort cleanup; ignore errors
+                    pass
+            # also clear internal reference
+            self._autosave_path = None
+        except Exception:
+            pass
+
     def insert_char(self, ch):
         # If selection active, replace selection with inserted char
         if self.sel_active:
@@ -73,11 +146,13 @@ class SimpleEditor:
         line = self.lines[self.cy]
         self.lines[self.cy] = line[: self.cx] + ch + line[self.cx :]
         self.cx += len(ch)
+        self.dirty = True
 
     def backspace(self):
         if self.sel_active:
             self.delete_selection()
             self.clear_selection()
+            self.dirty = True
             return
 
         if self.cx > 0:
@@ -85,6 +160,7 @@ class SimpleEditor:
             # Remove char before cursor
             self.lines[self.cy] = line[: self.cx - 1] + line[self.cx :]
             self.cx -= 1
+            self.dirty = True
         else:
             # Join with previous line if any
             if self.cy > 0:
@@ -93,19 +169,24 @@ class SimpleEditor:
                 del self.lines[self.cy]
                 self.cy -= 1
                 self.cx = prev_len
+                self.dirty = True
 
     def newline(self):
         if self.sel_active:
             self.delete_selection()
             self.clear_selection()
+            self.dirty = True
+            return
         line = self.lines[self.cy]
         new_line = line[self.cx :]
         self.lines[self.cy] = line[: self.cx]
         self.cy += 1
         self.lines.insert(self.cy, new_line)
         self.cx = 0
+        self.dirty = True
 
     def draw(self):
+        self._clear_expired_status()
         self.stdscr.erase()
         # Draw visible lines with selection highlight if active
         sel_range = None
@@ -287,17 +368,18 @@ class SimpleEditor:
             self.lines.insert(sy, first_part + last_part)
             self.cx = sx
             self.cy = sy
+        self.dirty = True
 
     def copy_selection(self):
         if not self.sel_active:
-            self.status_message = "No selection to copy"
+            self._set_status("No selection to copy")
             return
         self.clipboard = self.get_selected_text()
-        self.status_message = "Copied selection"
+        self._set_status("Copied selection")
 
     def cut_selection(self):
         if not self.sel_active:
-            self.status_message = "No selection to cut"
+            self._set_status("No selection to cut")
             return
         self.copy_selection()
         self.delete_selection()
@@ -305,11 +387,11 @@ class SimpleEditor:
         # After deletion, clamp and ensure visibility
         self.clamp_cursor()
         self.ensure_visible()
-        self.status_message = "Cut selection"
+        self._set_status("Cut selection")
 
     def paste_clipboard(self):
         if not self.clipboard:
-            self.status_message = "Clipboard empty"
+            self._set_status("Clipboard empty")
             return
         if self.sel_active:
             self.delete_selection()
@@ -344,7 +426,8 @@ class SimpleEditor:
 
         self.clamp_cursor()
         self.ensure_visible()
-        self.status_message = "Pasted"
+        self.dirty = True
+        self._set_status("Pasted")
 
     def handle_shift_movement(self, key):
         # Called when shift+arrow detected; start or extend selection and move cursor
@@ -393,8 +476,16 @@ class SimpleEditor:
         v -> paste clipboard
         s -> save (open save prompt)
         """
-        # Blocking read for the next key
-        next_ch = self.stdscr.getch()
+        # Temporarily block for the next key so leader feels natural.
+        # Restore the loop timeout afterwards.
+        prev_timeout = getattr(self, "loop_timeout", 200)
+        try:
+            self.stdscr.timeout(-1)
+            next_ch = self.stdscr.getch()
+        finally:
+            # restore non-blocking timeout
+            self.stdscr.timeout(prev_timeout)
+
         if next_ch == -1:
             return
         # Handle resize quickly
@@ -646,14 +737,14 @@ class SimpleEditor:
                 if filename:
                     try:
                         self.save_file(filename)
-                        self.status_message = f"Saved to {filename}"
+                        self._set_status(f"Saved to {filename}")
                     except Exception as e:
-                        self.status_message = f"Error saving: {e}"
+                        self._set_status(f"Error saving: {e}")
                 else:
-                    self.status_message = "Save cancelled (empty filename)"
+                    self._set_status("Save cancelled (empty filename)")
                 break
             elif ch in (27,):  # ESC
-                self.status_message = "Save cancelled"
+                self._set_status("Save cancelled")
                 break
             elif ch in (curses.KEY_RESIZE,):
                 self.update_size()
@@ -686,6 +777,15 @@ class SimpleEditor:
             with open(filename, "w", encoding="utf-8") as f:
                 f.write("\n".join(self.lines))
             self.filename = filename
+            self.dirty = False
+            # remove autosave file if present
+            autosave = self._determine_autosave_path()
+            try:
+                if autosave and os.path.exists(autosave):
+                    os.remove(autosave)
+                    self._autosave_path = None
+            except Exception:
+                pass
         except Exception:
             raise
 
@@ -698,11 +798,10 @@ class SimpleEditor:
                     data = f.read()
                 # Keep trailing empty line behavior similar to normal editors
                 self.lines = data.splitlines() if data != "" else [""]
-                # If file ends with newline, splitlines() will drop the final empty line;
-                # for simplicity we won't attempt to preserve exact trailing newline semantics.
+                self.dirty = False
             except Exception as e:
                 self.lines = [""]
-                self.status_message = f"Error opening {filename}: {e}"
+                self._set_status(f"Error opening {filename}: {e}")
         else:
             # Create the file (empty) and keep buffer empty
             try:
@@ -712,10 +811,11 @@ class SimpleEditor:
                     os.makedirs(dirpath, exist_ok=True)
                 open(filename, "w", encoding="utf-8").close()
                 self.lines = [""]
-                self.status_message = f"Created {filename}"
+                self._set_status(f"Created {filename}")
+                self.dirty = False
             except Exception as e:
                 self.lines = [""]
-                self.status_message = f"Error creating {filename}: {e}"
+                self._set_status(f"Error creating {filename}: {e}")
 
         # Reset cursor/scroll
         self.cx = 0
@@ -734,15 +834,28 @@ class SimpleEditor:
             pass
         self.update_size()
         self.draw()
+        # main loop: checks for autosave even when idle
         while not self.should_quit:
             try:
                 ch = self.stdscr.getch()
             except KeyboardInterrupt:
                 break
-            if ch == -1:
-                continue
-            self.handle_key(ch)
-            self.draw()
+            if ch != -1:
+                self.handle_key(ch)
+                self.draw()
+            # Autosave check (non-blocking)
+            now = time.time()
+            if self.dirty and (now - self._last_autosave) >= self.autosave_interval:
+                self.autosave()
+                # redraw to show status
+                self.draw()
+            # Clear transient status messages after duration
+            if (
+                self._status_time is not None
+                and (time.time() - self._status_time) >= self._status_duration
+            ):
+                self.status_message = ""
+                self._status_time = None
 
 
 def main(stdscr):
@@ -751,12 +864,21 @@ def main(stdscr):
     stdscr.keypad(True)
     curses.noecho()
     curses.cbreak()
-    stdscr.timeout(-1)  # Blocking getch
-
+    # Use a short timeout so we can run autosave checks when idle
+    loop_timeout_ms = 200
+    stdscr.timeout(loop_timeout_ms)  # Non-blocking getch with timeout
     # Check for file argument
     filename = sys.argv[1] if len(sys.argv) > 1 else None
     editor = SimpleEditor(stdscr, filename=filename)
-    editor.run()
+    editor.loop_timeout = loop_timeout_ms
+    try:
+        editor.run()
+    finally:
+        # Always attempt to clean up autosave on exit (best-effort)
+        try:
+            editor.cleanup_autosave()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
