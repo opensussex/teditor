@@ -642,6 +642,10 @@ begin
   prompt := ':';
   cmd_chars := '';
   
+  { Clear any pending keyboard events before starting }
+  while PollKeyEvent <> 0 do
+    GetKeyEvent;
+  
   while True do
   begin
     display := prompt + cmd_chars;
@@ -658,6 +662,10 @@ begin
     
     SetCursorPos(Length(display), max_y - 1);
     UpdateScreen(False);
+    
+    { Wait for keyboard event }
+    while PollKeyEvent = 0 do
+      Sleep(10);
     
     k := GetKeyEvent;
     k := TranslateKeyEvent(k);
@@ -685,6 +693,10 @@ begin
       end;
     end;
   end;
+  
+  { Clear any remaining keyboard events after exiting }
+  while PollKeyEvent <> 0 do
+    GetKeyEvent;
 end;
 
 procedure TSimpleEditor.SavePrompt(const prefill: String);
@@ -699,6 +711,10 @@ var
 begin
   prompt := 'Save as: ';
   cmd_chars := prefill;
+  
+  { Clear any pending keyboard events before starting }
+  while PollKeyEvent <> 0 do
+    GetKeyEvent;
   
   while True do
   begin
@@ -716,6 +732,10 @@ begin
     
     SetCursorPos(Length(display), max_y - 1);
     UpdateScreen(False);
+    
+    { Wait for keyboard event }
+    while PollKeyEvent = 0 do
+      Sleep(10);
     
     k := GetKeyEvent;
     k := TranslateKeyEvent(k);
@@ -757,6 +777,10 @@ begin
       end;
     end;
   end;
+  
+  { Clear any remaining keyboard events after exiting }
+  while PollKeyEvent <> 0 do
+    GetKeyEvent;
 end;
 
 procedure TSimpleEditor.SaveFile(const fname: String);
