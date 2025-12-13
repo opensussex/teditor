@@ -608,10 +608,12 @@ var
   ch: Char;
   lch: String;
 begin
+  { Wait for next key after Ctrl-W leader }
   k := GetKeyEvent;
   k := TranslateKeyEvent(k);
   
-  if GetKeyEventFlags(k) = 0 then
+  { Check for ASCII character (fixed: was checking for 0) }
+  if GetKeyEventFlags(k) = kbASCII then
   begin
     ch := GetKeyEventChar(k);
     lch := LowerCase(ch);

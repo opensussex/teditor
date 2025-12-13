@@ -1,0 +1,12 @@
+# Allow the compiled binary
+!ted
+
+# Ignore common build artifacts
+*.o
+*.ppu
+*.a
+*.so
+
+# Ignore autosave files
+.*.autosave
+.ted_autosave
